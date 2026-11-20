@@ -8,6 +8,7 @@ const statusEl = document.getElementById('status');
 const findEl = document.getElementById('find');
 const findQ = document.getElementById('find-q');
 const findN = document.getElementById('find-n');
+srcEl.readOnly = true;
 
 function setMode(m) {
   main.className = m;
@@ -43,11 +44,21 @@ function setStatus(text, warn = false) {
 
 function showHtml(html) {
   mdEl.innerHTML = html;
-  const seen = {};
+  const used = new Set(Array.from(document.querySelectorAll('[id]'), el => el.id));
+  const nextSuffix = new Map();
   mdEl.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(h => {
     if (h.id) return;
-    let id = slug(h.textContent); const n = seen[id] = (seen[id] || 0) + 1;
-    h.id = n > 1 ? `${id}-${n - 1}` : id;
+    const base = slug(h.textContent) || 'section';
+    let id = base;
+    if (used.has(id)) {
+      let suffix = nextSuffix.get(base) || 1;
+      do {
+        id = `${base}-${suffix++}`;
+      } while (used.has(id));
+      nextSuffix.set(base, suffix);
+    }
+    h.id = id;
+    used.add(id);
   });
   mdEl.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
   markRendered();
@@ -59,9 +70,9 @@ function syncGutter() {
   const q = query();
   gutterEl.innerHTML = srcEl.value.split('\n').map(l => {
     let html = '', at = 0;
-    for (const i of matchesIn(l, q)) {
-      html += esc(l.slice(at, i)) + '<mark class="hit">' + esc(l.slice(i, i + q.length)) + '</mark>';
-      at = i + q.length;
+    for (const [start, end] of matchesIn(l, q)) {
+      html += esc(l.slice(at, start)) + '<mark class="hit">' + esc(l.slice(start, end)) + '</mark>';
+      at = end;
     }
     return '<span class="l">' + (html + esc(l.slice(at)) || ' ') + '</span>';
   }).join('');
@@ -72,15 +83,14 @@ function syncGutter() {
 // Matches are highlighted in both panes; the source pane drives navigation unless it is hidden.
 let findIdx = 0;
 function findOpen() { return !findEl.hidden; }
-function query() { return findOpen() ? findQ.value.toLowerCase() : ''; }
+function query() {
+  if (!findOpen() || !findQ.value) return null;
+  return new RegExp(findQ.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+}
 function srcPrimary() { return main.className !== 'ren-only'; }
 
 function matchesIn(text, q) {
-  const out = [];
-  if (!q) return out;
-  text = text.toLowerCase();
-  for (let i = text.indexOf(q); i >= 0; i = text.indexOf(q, i + q.length)) out.push(i);
-  return out;
+  return q ? Array.from(text.matchAll(q), match => [match.index, match.index + match[0].length]) : [];
 }
 
 function markRendered() {
@@ -95,12 +105,12 @@ function markRendered() {
       if (!hits.length) continue;
       const f = document.createDocumentFragment();
       let at = 0;
-      for (const i of hits) {
+      for (const [start, end] of hits) {
         const m = document.createElement('mark');
         m.className = 'hit';
-        m.textContent = t.slice(i, i + q.length);
-        f.append(t.slice(at, i), m);
-        at = i + q.length;
+        m.textContent = t.slice(start, end);
+        f.append(t.slice(at, start), m);
+        at = end;
       }
       f.append(t.slice(at));
       n.replaceWith(f);
@@ -122,14 +132,14 @@ function showMatch(scroll) {
   m.scrollIntoView({ block: 'center' });
   // Select it in the editor too, so closing the bar leaves the caret on the match.
   if (srcPrimary()) {
-    const at = matchesIn(srcEl.value, query())[findIdx];
-    srcEl.setSelectionRange(at, at + findQ.value.length);
+    const range = matchesIn(srcEl.value, query())[findIdx];
+    if (range) srcEl.setSelectionRange(...range);
   }
 }
 
 function runFind() {
   // Start from the first match at or after the caret.
-  const after = srcPrimary() ? matchesIn(srcEl.value, query()).findIndex(i => i >= srcEl.selectionStart) : 0;
+  const after = srcPrimary() ? matchesIn(srcEl.value, query()).findIndex(([start]) => start >= srcEl.selectionStart) : 0;
   findIdx = Math.max(after, 0);
   syncGutter();
   markRendered();
@@ -177,6 +187,11 @@ document.getElementById('find-close').onclick = closeFind;
 // --- Editing ---------------------------------------------------------------------------------
 let dirty = false;
 let renderTimer = 0, renderSeq = 0;
+let refreshSeq = 0;
+let revision = 0;
+let savedRaw = null;
+let pendingSave = null;
+let queuedSave = null;
 
 function setDirty(d) {
   if (d === dirty) return;
@@ -194,11 +209,13 @@ async function renderLive() {
     showHtml(d.html);
     renEl.scrollTop = keep;
   } catch (e) {
-    setStatus('preview error: ' + e, true);
+    if (seq === renderSeq) setStatus('preview error: ' + e, true);
   }
 }
 
 srcEl.addEventListener('input', () => {
+  revision++;
+  renderSeq++;
   syncGutter();
   setDirty(true);
   setStatus('edited');
@@ -213,13 +230,47 @@ srcEl.addEventListener('keydown', e => {
   if (!e.shiftKey) document.execCommand('insertText', false, '  ');
 });
 
+function editorText(raw) {
+  return raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+}
+
+function fileText(raw, text) {
+  if (text === editorText(raw)) return raw;
+  const bom = raw.startsWith('\uFEFF') ? '\uFEFF' : '';
+  const newline = raw.match(/\r\n|[\r\n]/)?.[0] || '\n';
+  return bom + text.replace(/\n/g, newline);
+}
+
 // Called from the native side (⌘S, or "Save" when closing with unsaved changes).
 function save(close) {
-  post((close ? 'save-close:' : 'save:') + srcEl.value);
+  if (savedRaw === null) return;
+  if (pendingSave) {
+    if (!pendingSave.close) queuedSave = close || queuedSave === true;
+    return;
+  }
+  if (!dirty && !close) return;
+
+  const raw = fileText(savedRaw, srcEl.value);
+  pendingSave = { raw, revision, close };
+  if (close) srcEl.readOnly = true;
+  post('save:' + JSON.stringify([close, savedRaw, raw]));
 }
-function saved() {
-  dirty = false;
-  setStatus('saved ' + new Date().toLocaleTimeString());
+
+function saveFinished(ok) {
+  if (!pendingSave) return;
+  const { raw, revision: savedRevision, close } = pendingSave;
+  const next = queuedSave;
+  pendingSave = queuedSave = null;
+  if (close) srcEl.readOnly = false;
+  if (!ok) return;
+
+  savedRaw = raw;
+  if (savedRevision === revision) {
+    setDirty(false);
+    setStatus('saved ' + new Date().toLocaleTimeString());
+  }
+  refresh();
+  if (next !== null) save(next);
 }
 
 // WebView2 keeps key presses to itself, so the menu's shortcuts never fire on Windows: handle them here.
@@ -244,26 +295,41 @@ if (!navigator.userAgent.includes('Mac')) {
 
 // --- Loading from disk -------------------------------------------------------------------------
 async function refresh() {
+  const seq = ++refreshSeq;
   try {
     const d = await (await fetch('/__mdp/content', { cache: 'no-store' })).json();
+    if (seq !== refreshSeq) return;
     document.body.classList.toggle('is-empty', !!d.empty);
     if (d.empty) { setStatus(''); return; }
     if (d.error) { setStatus(d.error, true); return; }
     document.querySelector('base').href = d.base;
     // Never overwrite unsaved edits with the version on disk.
-    if (dirty) { setStatus('file changed on disk; saving will overwrite it', true); return; }
+    if (dirty) {
+      if (d.raw !== savedRaw || d.readOnly) setStatus('file changed on disk', true);
+      return;
+    }
+    if (!d.readOnly && d.raw === savedRaw && !statusEl.classList.contains('warn')) return;
+    savedRaw = d.readOnly ? null : d.raw;
+    srcEl.readOnly = !!d.readOnly;
+    clearTimeout(renderTimer);
+    renderSeq++;
     const keep = [rawEl.scrollTop, renEl.scrollTop];
-    if (srcEl.value !== d.raw) {
+    const text = editorText(d.raw);
+    if (srcEl.value !== text) {
       const [a, b] = [srcEl.selectionStart, srcEl.selectionEnd];
-      srcEl.value = d.raw;
+      srcEl.value = text;
       srcEl.setSelectionRange(a, b);
       syncGutter();
     }
     showHtml(d.html);
     [rawEl.scrollTop, renEl.scrollTop] = keep;
-    setStatus('updated ' + new Date().toLocaleTimeString());
+    if (d.readOnly) {
+      setStatus('This file is not UTF-8 and is open in read-only mode.', true);
+    } else {
+      setStatus('updated ' + new Date().toLocaleTimeString());
+    }
   } catch (e) {
-    setStatus('error: ' + e, true);
+    if (seq === refreshSeq) setStatus('error: ' + e, true);
   }
 }
 refresh();

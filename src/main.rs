@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -49,7 +50,7 @@ enum UserEvent {
     PickFiles,
     Menu(MenuEvent),
     /// Text to write to the window's document; `close` closes the window afterwards.
-    Save { id: WindowId, text: String, close: bool },
+    Save { id: WindowId, original: String, text: String, close: bool },
     Dirty(WindowId, bool),
 }
 
@@ -161,7 +162,7 @@ fn main() {
                 for v in viewers.values_mut() {
                     let Some(path) = v.doc.lock().unwrap().clone() else { continue };
                     let m = mtime(&path);
-                    if m.is_some() && m != v.mtime {
+                    if m != v.mtime {
                         v.mtime = m;
                         let _ = v.webview.evaluate_script("refresh()");
                     }
@@ -230,10 +231,13 @@ fn main() {
                     update_title(v);
                 }
             }
-            Event::UserEvent(UserEvent::Save { id, text, close }) => {
-                let saved = viewers.get_mut(&id).is_some_and(|v| save(v, &text));
+            Event::UserEvent(UserEvent::Save { id, original, text, close }) => {
+                let Some(v) = viewers.get_mut(&id) else { return };
+                let saved = save(v, &original, &text);
                 if saved && close {
                     close_viewer(&menu, &mut viewers, id, control_flow);
+                } else {
+                    let _ = v.webview.evaluate_script(&format!("saveFinished({saved})"));
                 }
             }
             Event::WindowEvent { window_id, event, .. } => match event {
@@ -291,6 +295,8 @@ fn confirm_close(v: &Viewer) -> CloseChoice {
         .set_parent(&v.window)
         .show();
     match res {
+        rfd::MessageDialogResult::Yes => CloseChoice::Save,
+        rfd::MessageDialogResult::No => CloseChoice::Discard,
         rfd::MessageDialogResult::Custom(s) if s == save => CloseChoice::Save,
         rfd::MessageDialogResult::Custom(s) if s == discard => CloseChoice::Discard,
         _ => CloseChoice::Cancel,
@@ -306,27 +312,82 @@ fn confirm_quit(unsaved: usize) -> bool {
         .set_description(format!("{docs} unsaved changes. Quit and discard them?"))
         .set_buttons(rfd::MessageButtons::OkCancelCustom(quit.clone(), "Cancel".into()))
         .show();
-    matches!(res, rfd::MessageDialogResult::Custom(s) if s == quit)
+    match res {
+        rfd::MessageDialogResult::Ok => true,
+        rfd::MessageDialogResult::Custom(s) => s == quit,
+        _ => false,
+    }
 }
 
-/// Write `text` to the viewer's document. Returns whether it was saved.
-fn save(v: &mut Viewer, text: &str) -> bool {
-    let Some(path) = v.doc.lock().unwrap().clone() else { return false };
-    if let Err(e) = std::fs::write(&path, text) {
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Error)
-            .set_title("Couldn't save")
-            .set_description(format!("{}: {e}", path.display()))
-            .set_parent(&v.window)
-            .show();
-        return false;
+fn confirm_overwrite(v: &Viewer, path: &Path, deleted: bool) -> bool {
+    let name = title_for(path);
+    let message = if deleted {
+        format!("“{name}” is missing from disk. Recreate it with your edits?")
+    } else {
+        format!("“{name}” changed on disk. Replace its current contents with your edits?")
+    };
+    let result = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("File changed on disk")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .set_parent(&v.window)
+        .show();
+    result == rfd::MessageDialogResult::Yes
+}
+
+fn read_current(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
-    // Record our own write so the poller doesn't treat it as an external change.
-    v.mtime = mtime(&path);
-    v.dirty = false;
-    update_title(v);
-    let _ = v.webview.evaluate_script("saved()");
-    true
+}
+
+fn write_edit(v: &Viewer, path: &Path, original: &str, text: &str) -> io::Result<bool> {
+    let current = read_current(path)?;
+    if current.as_deref() != Some(original.as_bytes()) {
+        if !confirm_overwrite(v, path, current.is_none()) {
+            return Ok(false);
+        }
+        if read_current(path)? != current {
+            return Err(io::Error::other("The file changed again. Review it before trying to save again."));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if current.is_some() {
+        options.truncate(true);
+    } else {
+        // If the file reappeared, preserve it and let the user retry.
+        options.create_new(true);
+    }
+    options.open(path)?.write_all(text.as_bytes())?;
+    Ok(true)
+}
+
+fn save(v: &mut Viewer, original: &str, text: &str) -> bool {
+    let Some(path) = v.doc.lock().unwrap().clone() else { return false };
+    if text == original {
+        return true;
+    }
+    match write_edit(v, &path, original, text) {
+        Ok(saved) => {
+            if saved {
+                v.mtime = mtime(&path);
+            }
+            saved
+        }
+        Err(e) => {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("Couldn't save")
+                .set_description(format!("{}: {e}", path.display()))
+                .set_parent(&v.window)
+                .show();
+            false
+        }
+    }
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -336,7 +397,7 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 fn update_title(v: &Viewer) {
     let Some(path) = v.doc.lock().unwrap().clone() else { return };
     let title = title_for(&path);
-    v.window.set_title(&if v.dirty { format!("{title} — Edited") } else { title });
+    v.window.set_title(&if v.dirty { format!("{title} (Edited)") } else { title });
 }
 
 /// Focus the window already showing `path`, else reuse an empty window, else open a new one.
@@ -354,7 +415,8 @@ fn open_path(
     }
     if let Some(v) = viewers.values_mut().find(|v| v.doc.lock().unwrap().is_none()) {
         *v.doc.lock().unwrap() = Some(path.clone());
-        v.mtime = None; // the next poll sees a "change" and calls refresh()
+        v.mtime = mtime(&path);
+        let _ = v.webview.evaluate_script("refresh()");
         v.window.set_title(&title_for(&path));
         v.window.set_focus();
         return;
@@ -397,10 +459,9 @@ fn new_viewer(
             let body = req.body();
             let event = if body == "open" {
                 UserEvent::PickFiles
-            } else if let Some(text) = body.strip_prefix("save:") {
-                UserEvent::Save { id, text: text.to_owned(), close: false }
-            } else if let Some(text) = body.strip_prefix("save-close:") {
-                UserEvent::Save { id, text: text.to_owned(), close: true }
+            } else if let Some(payload) = body.strip_prefix("save:") {
+                let Ok((close, original, text)) = serde_json::from_str(payload) else { return };
+                UserEvent::Save { id, original, text, close }
             } else if let Some(flag) = body.strip_prefix("dirty:") {
                 UserEvent::Dirty(id, flag == "1")
             } else {
@@ -531,15 +592,18 @@ fn content_json(path: Option<&Path>) -> String {
     let Some(path) = path else {
         return serde_json::json!({ "empty": true }).to_string();
     };
-    let raw = match std::fs::read(path) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+    let raw = match read_current(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return serde_json::json!({ "error": format!("File missing: {}", path.display()) }).to_string(),
         Err(e) => return serde_json::json!({ "error": format!("{}: {e}", path.display()) }).to_string(),
     };
-    let rendered = render(&raw);
+    let raw = String::from_utf8_lossy(&raw);
+    let read_only = matches!(raw, Cow::Owned(_));
+    let rendered = render(raw.strip_prefix('\u{feff}').unwrap_or(&raw));
     const PATH_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'%').add(b'?').add(b'<').add(b'>');
     let dir = url_path(path.parent().unwrap_or(Path::new("/")));
     let base = format!("{ORIGIN}{}/", utf8_percent_encode(dir.trim_end_matches('/'), PATH_SET));
-    serde_json::json!({ "raw": raw, "html": rendered, "base": base }).to_string()
+    serde_json::json!({ "raw": raw, "html": rendered, "base": base, "readOnly": read_only }).to_string()
 }
 
 fn render(md: &str) -> String {
